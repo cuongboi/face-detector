@@ -8,10 +8,10 @@ class FaceDetection:
     bbox: np.ndarray  # (4,) x1, y1, x2, y2 in frame pixels
     score: float
     kps5: np.ndarray | None = None  # (5, 2) eyes, nose, mouth corners in frame pixels
-    landmarks: np.ndarray | None = None  # (478, 3) MediaPipe landmarks in frame pixels
+    landmarks: np.ndarray | None = None  # (76, 2) Vision landmarks in frame pixels
     yaw: float | None = None  # degrees, + = nose towards image right
     pitch: float | None = None  # degrees, + = looking up
-    source: str = "yolo"  # where kps5 came from: "mediapipe" | "yolo"
+    source: str = "vision"  # where kps5 came from
 
     @property
     def size(self) -> float:

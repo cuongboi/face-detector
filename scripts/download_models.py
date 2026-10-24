@@ -1,4 +1,8 @@
-"""Download all models into data/models. Re-running skips files that already exist."""
+"""Download all source models into data/models, then convert them to Core ML.
+
+Re-running skips files that already exist. Needs the `convert` group:
+    uv run --group convert python scripts/download_models.py
+"""
 
 import hashlib
 import shutil
@@ -9,13 +13,10 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.convert_models import ARCFACE_ONNX, NAFNET_GOPRO_PTH, NAFNET_SIDD_PTH  # noqa: E402
+from scripts.convert_models import main as convert_all  # noqa: E402
 from utils.config import get_settings  # noqa: E402
 
-YOLO_FACE_URL = "https://github.com/akanametov/yolo-face/releases/download/1.0.0/yolov11n-face.pt"
-LANDMARKER_URL = (
-    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
-    "face_landmarker/float16/1/face_landmarker.task"
-)
 BUFFALO_L_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
 # Official NAFNet width-32 checkpoints (megvii-research/NAFNet README), hosted on Google Drive.
 NAFNET_SIDD_GDRIVE_ID = "1lsByk21Xw-6aW7epCwOQxvm6HYCQZPHZ"
@@ -52,12 +53,7 @@ def main() -> None:
     s = get_settings()
     s.models_dir.mkdir(parents=True, exist_ok=True)
 
-    for url, name in ((YOLO_FACE_URL, s.yolo_model), (LANDMARKER_URL, s.landmarker_model)):
-        dest = s.model_path(name)
-        if not dest.exists():
-            _download(url, dest)
-
-    embedder = s.model_path(s.embedder_model)
+    embedder = s.model_path(ARCFACE_ONNX)
     if not embedder.exists():
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = Path(tmp) / "buffalo_l.zip"
@@ -68,16 +64,17 @@ def main() -> None:
                     shutil.copyfileobj(src, dst)
 
     for file_id, name in (
-        (NAFNET_SIDD_GDRIVE_ID, s.denoise_model), (NAFNET_GOPRO_GDRIVE_ID, s.deblur_model)
+        (NAFNET_SIDD_GDRIVE_ID, NAFNET_SIDD_PTH), (NAFNET_GOPRO_GDRIVE_ID, NAFNET_GOPRO_PTH)
     ):
         dest = s.model_path(name)
         if not dest.exists():
             _download_gdrive(file_id, dest)
 
-    names = (s.yolo_model, s.landmarker_model, s.embedder_model, s.denoise_model, s.deblur_model)
-    for name in names:
+    for name in (ARCFACE_ONNX, NAFNET_SIDD_PTH, NAFNET_GOPRO_PTH):
         path = s.model_path(name)
         print(f"✓ {name}  {path.stat().st_size / 1e6:.1f} MB  sha256={_sha256(path)[:16]}…")
+
+    convert_all()
 
 
 if __name__ == "__main__":

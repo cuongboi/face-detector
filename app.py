@@ -14,18 +14,19 @@ from urllib.parse import urlsplit
 import cv2
 import gradio as gr
 import numpy as np
+import pandas as pd
 
 from core.attendance import AttendanceService, FaceState
 from core.embedder import Embedder
 from core.enhancer import FaceEnhancer
 from core.enrollment import DONE_HINT, POSE_HINTS, POSES, EnrollmentSession
-from core.hybrid_detector import HybridDetector
 from core.pipeline import FacePipeline
 from core.repository import Repository
 from core.rtsp import RTSP_SCHEMES, RtspCamera, redact
 from core.vector_store import VectorStore
+from core.vision_detector import VisionDetector
 from utils.config import get_settings
-from utils.face_utils import draw_badge, draw_face
+from utils.face_utils import decode_snapshot, draw_badge, draw_face
 from utils.logger import get_logger
 
 log = get_logger("app")
@@ -35,9 +36,17 @@ STATE_COLORS = {  # BGR
     FaceState.UNKNOWN: (60, 60, 230),
     FaceState.VERIFYING: (0, 200, 255),
     FaceState.CHECKED_IN: (80, 220, 80),
+    FaceState.CHECKED_OUT: (220, 120, 200),
     FaceState.COOLDOWN: (200, 160, 60),
 }
 BADGE_COLOR = (60, 170, 40)  # BGR green
+# Repository.daily_summary columns -> UI labels (order matters: used to read clicked rows).
+SUMMARY_COLUMNS = {
+    "day": "Ngày", "name": "Họ tên", "employee_id": "Mã NV",
+    "check_in": "Vào", "check_out": "Ra", "in_score": "Điểm vào", "out_score": "Điểm ra",
+}
+MAX_BADGES = 5
+WRITTEN = {FaceState.CHECKED_IN: "Vào", FaceState.CHECKED_OUT: "Ra"}  # badge prefix
 PLACEHOLDER = np.full((112, 112, 3), 40, np.uint8)
 STREAM_EVERY = 0.15
 # Gradio processes only the latest frame, so a short interval just means less idle time.
@@ -50,14 +59,19 @@ CAM_FRONT, CAM_BACK, CAM_RTSP = "Camera trước", "Camera sau", "Camera IP (RTS
 def _facing_webcam(facing: str) -> gr.WebcamOptions:
     """Phone camera by facing mode ("user" = selfie, "environment" = back).
 
-    Raw (un-mirrored) frames so left/right poses are the subject's own; 720p for far faces.
+    Raw (un-mirrored) frames so left/right poses are the subject's own; the highest resolution
+    the camera offers up to FA_WEBCAM_WIDTH x FA_WEBCAM_HEIGHT (4K by default) for far faces.
     """
-    return gr.WebcamOptions(
-        mirror=False,
-        constraints={
-            "video": {"facingMode": facing, "width": {"ideal": 1280}, "height": {"ideal": 720}}
-        },
-    )
+    size = {"width": {"ideal": settings.webcam_width}, "height": {"ideal": settings.webcam_height}}
+    return gr.WebcamOptions(mirror=False, constraints={"video": {"facingMode": facing, **size}})
+
+
+def _fit_display(img: np.ndarray) -> np.ndarray:
+    """Downscale a preview to FA_DISPLAY_MAX_WIDTH (sending 4K back to the browser is slow)."""
+    scale = settings.display_max_width / img.shape[1]
+    if scale >= 1:
+        return img
+    return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
 
 # The raw webcam can't be hidden (hiding unmounts it and stops the stream), so the
@@ -71,6 +85,28 @@ CSS = """
 .cam-stage .cam-src .button-wrap { z-index: 2; }
 .cam-stage .cam-src [title="grant webcam access"] { position: relative; z-index: 2; }
 .cam-stage .cam-out img { object-fit: contain; }
+"""
+
+
+# Gradio's streaming webcam needs a second click on "start recording" after camera access is
+# granted. Click it automatically once the video is live, once per webcam button, so a manual
+# stop afterwards is respected. Selectors match gradio 6 (Image webcam, `.capture-button`).
+AUTO_RECORD_JS = """
+() => {
+  const started = new WeakSet();
+  const tryStart = () => {
+    document.querySelectorAll(".cam-src").forEach((cam) => {
+      const btn = cam.querySelector("button.capture-button");
+      const video = cam.querySelector('video[data-testid="webcam-video"]');
+      if (!btn || started.has(btn) || !video || video.readyState < 2) return;
+      if (!btn.querySelector('[title="start recording"]')) return;
+      started.add(btn);
+      btn.click();
+    });
+  };
+  new MutationObserver(tryStart).observe(document.body, { childList: true, subtree: true });
+  document.addEventListener("loadeddata", tryStart, true);  // video became live
+}
 """
 
 
@@ -94,6 +130,16 @@ def _camera_stage(output_label: str) -> tuple[gr.Image, gr.Image, gr.Image]:
     return front, back, output
 
 
+def _mirror(frame: np.ndarray) -> np.ndarray:
+    """Selfie view for webcam previews. Detection runs on the raw frame so left/right poses
+    stay the subject's own; only the display is flipped, and boxes with it (_mirror_box)."""
+    return np.ascontiguousarray(frame[:, ::-1])
+
+
+def _mirror_box(bbox: np.ndarray, width: int) -> np.ndarray:
+    return np.array([width - bbox[2], bbox[1], width - bbox[0], bbox[3]])
+
+
 def _show_camera(side: str):
     return gr.update(visible=side == CAM_FRONT), gr.update(visible=side == CAM_BACK)
 
@@ -103,7 +149,7 @@ def _show_attend_source(source: str):
 
 
 def _missing_models() -> list[str]:
-    names = (settings.yolo_model, settings.landmarker_model, settings.embedder_model)
+    names = (settings.embedder_model,)
     if settings.enhance_enabled:
         names += (settings.denoise_model, settings.deblur_model)
     return [n for n in names if not settings.model_path(n).exists()]
@@ -112,11 +158,12 @@ def _missing_models() -> list[str]:
 class App:
     def __init__(self):
         enhancer = FaceEnhancer(settings) if settings.enhance_enabled else None
-        self.pipeline = FacePipeline(HybridDetector(settings), Embedder(settings), enhancer)
+        self.pipeline = FacePipeline(VisionDetector(settings), Embedder(settings), enhancer)
         self.repo = Repository(settings.db_path)
         self.store = VectorStore(settings.qdrant_url, settings.collection, settings.embedding_dim)
         self.attendance = AttendanceService(settings, self.repo)
-        self._badge: tuple[str, float] | None = None  # (text, show until)
+        # person_id -> (text, show until); one badge per person written recently.
+        self._badges: dict[int, tuple[str, float]] = {}
         # One server-side IP camera at a time: starting a new one (any client) stops the old.
         self._rtsp: RtspCamera | None = None
         self._rtsp_lock = threading.Lock()
@@ -144,21 +191,25 @@ class App:
         done = len(POSES) - len(session.missing)
         return f"**{done}/{len(POSES)} góc** — {message}"
 
-    def _offer_frame(self, frame_rgb: np.ndarray, state: dict, manual: bool):
+    def _offer_frame(self, frame_rgb: np.ndarray, state: dict, manual: bool, mirror: bool):
         session: EnrollmentSession = state["session"]
         frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         faces = self.pipeline.analyze(frame)
         if not faces:
             target = session.target
             msg = POSE_HINTS[target] if target else DONE_HINT
-            return frame_rgb, self._status(session, f"Không thấy khuôn mặt. {msg}")
+            view = _mirror(frame_rgb) if mirror else frame_rgb
+            return view, self._status(session, f"Không thấy khuôn mặt. {msg}")
         # Enrollment is close-range: take the largest face.
         face = max(faces, key=lambda f: f.detection.size)
         result = session.offer(face, time.monotonic(), manual=manual)
         det = face.detection
         ok = result.pose is not None and result.pose == (result.captured or session.target)
         label = f"{result.pose or '?'} yaw {det.yaw or 0:+.0f} pitch {det.pitch or 0:+.0f}"
-        draw_face(frame, det.bbox, label, (80, 220, 80) if ok else (0, 165, 255))
+        bbox = det.bbox
+        if mirror:
+            frame, bbox = _mirror(frame), _mirror_box(bbox, frame.shape[1])
+        draw_face(frame, bbox, label, (80, 220, 80) if ok else (0, 165, 255))
         msg = result.message
         if len(faces) > 1:
             msg += " (có nhiều người trong khung hình)"
@@ -170,7 +221,8 @@ class App:
             return gr.skip(), gr.skip(), gr.skip(), state
         state["frame"] = frame_rgb
         before = len(state["session"].captures)
-        preview, status = self._offer_frame(frame_rgb, state, manual=False)
+        preview, status = self._offer_frame(frame_rgb, state, manual=False, mirror=True)
+        preview = _fit_display(preview)
         gallery = (
             self._gallery(state["session"])
             if len(state["session"].captures) != before else gr.skip()
@@ -180,10 +232,12 @@ class App:
     def enroll_manual(self, frame_rgb, state):
         """'Chụp' button (frame = last webcam frame) or uploaded image."""
         state = self._session(state)
+        from_webcam = frame_rgb is None  # uploads are shown as is
         frame_rgb = frame_rgb if frame_rgb is not None else state.get("frame")
         if frame_rgb is None:
             return gr.skip(), "Chưa có ảnh", gr.skip(), state
-        preview, status = self._offer_frame(frame_rgb, state, manual=True)
+        preview, status = self._offer_frame(frame_rgb, state, manual=True, mirror=from_webcam)
+        preview = _fit_display(preview)
         return preview, status, self._gallery(state["session"]), state
 
     def enroll_retake(self, pose, state):
@@ -227,37 +281,47 @@ class App:
     def attend_stream(self, frame_rgb):
         if frame_rgb is None:
             return gr.skip(), gr.skip()
-        return self._attend_frame(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        preview, recent = self._attend_frame(
+            cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR), mirror=True
+        )
+        return _fit_display(preview), recent
 
-    def _attend_frame(self, frame: np.ndarray):
+    def _attend_frame(self, frame: np.ndarray, mirror: bool = False):
         """Recognize + log + annotate one BGR frame -> (RGB preview, recent table or skip)."""
         faces = self.pipeline.analyze(frame)
-        observations = [
-            (f.detection.bbox, self.store.search(f.embedding, settings.search_top_k))
-            for f in faces
-        ]
+        raw = frame.copy()  # saved with check-ins: un-mirrored, no boxes
+        if mirror:
+            frame = _mirror(frame)
+        matches = self.store.search_batch(
+            np.array([f.embedding for f in faces]), settings.search_top_k
+        )
+        observations = [(f.detection.bbox, m) for f, m in zip(faces, matches, strict=True)]
         now = time.time()
-        statuses = self.attendance.update(observations, now)
+        statuses = self.attendance.update(observations, now, frame=raw)
         logged = False
         for face, st in zip(faces, statuses, strict=True):
             if st.match is None:
                 label = "Unknown"
             else:
                 label = f"{st.match.name} {st.match.score:.2f}"
-                if st.state == FaceState.CHECKED_IN:
-                    label += " ✓"
+                if st.state in WRITTEN:
+                    label += " IN" if st.state == FaceState.CHECKED_IN else " OUT"
                     logged = True
                     text = (
-                        f"✓ {st.match.name} ({st.match.employee_id})"
+                        f"✓ {WRITTEN[st.state]}: {st.match.name} ({st.match.employee_id})"
                         f" {datetime.fromtimestamp(now):%H:%M}"
                     )
-                    self._badge = (text, now + settings.badge_seconds)
+                    self._badges.pop(st.match.person_id, None)  # re-insert: newest last
+                    self._badges[st.match.person_id] = (text, now + settings.badge_seconds)
             if face.enhanced:  # NAFNet restored this crop (cv2 font: ASCII only)
                 label += " +" + "/".join(face.enhanced)
-            draw_face(frame, st.bbox, label, STATE_COLORS[st.state])
-        if self._badge and now < self._badge[1]:
-            draw_badge(frame, self._badge[0], BADGE_COLOR, settings.badge_font)
-        recent = self.repo.history(limit=15) if logged else gr.skip()
+            bbox = _mirror_box(st.bbox, frame.shape[1]) if mirror else st.bbox
+            draw_face(frame, bbox, label, STATE_COLORS[st.state])
+        self._badges = {p: b for p, b in self._badges.items() if now < b[1]}
+        top = 0
+        for text, _ in list(reversed(self._badges.values()))[:MAX_BADGES]:  # newest on top
+            top = draw_badge(frame, text, BADGE_COLOR, settings.badge_font, top)
+        recent = self._today() if logged else gr.skip()
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), recent
 
     def rtsp_stream(self, url: str):
@@ -286,11 +350,7 @@ class App:
                 seq = seq_new
                 h, w = frame.shape[:2]
                 preview, recent = self._attend_frame(frame.copy())
-                scale = settings.rtsp_display_max_width / w
-                if scale < 1:
-                    preview = cv2.resize(
-                        preview, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-                    )
+                preview = _fit_display(preview)
                 msg = f"🟢 `{shown}` — {w}×{h}"
                 yield preview, recent, msg if msg != status else gr.skip()
                 status = msg
@@ -320,15 +380,36 @@ class App:
         self.attendance.forget_person(person_id)
         return f"Đã xoá người ID {person_id}", self.repo.list_persons()
 
+    def _today(self) -> pd.DataFrame:
+        return self.repo.daily_summary(date.today()).rename(columns=SUMMARY_COLUMNS)
+
+    def show_snapshot(self, evt: gr.SelectData):
+        """Clicked summary row -> check-out photo if a Ra cell was clicked, else check-in."""
+        c = SUMMARY_COLUMNS
+        row = dict(zip(c.values(), evt.row_value, strict=False))
+        col = list(c.values())[evt.index[1]]
+        kind = "out" if col in (c["check_out"], c["out_score"]) and row[c["check_out"]] else "in"
+        ts = row[c["check_out"] if kind == "out" else c["check_in"]]
+        image = self.repo.snapshot(row[c["employee_id"]], row[c["day"]], kind)
+        if image is None:
+            return gr.update(value=None, label="Ảnh chụp (không có ảnh)")
+        label = f"Ảnh {'ra' if kind == 'out' else 'vào'} — {row[c['name']]} {ts}"
+        return gr.update(value=decode_snapshot(image), label=label)
+
     def history(self, day_str: str):
         try:
             day = date.fromisoformat(day_str.strip()) if day_str and day_str.strip() else None
         except ValueError:
             return gr.skip(), None, "Ngày không hợp lệ (YYYY-MM-DD)"
-        df = self.repo.history(day)
-        path = settings.data_dir / f"attendance_{day or 'all'}.csv"
-        df.to_csv(path, index=False)
-        return df, str(path), f"{len(df)} bản ghi"
+        summary = self.repo.daily_summary(day)
+        log_df = self.repo.history(day)
+        paths = []
+        for kind, df in (("summary", summary), ("log", log_df)):
+            path = settings.data_dir / f"attendance_{kind}_{day or 'all'}.csv"
+            df.to_csv(path, index=False)
+            paths.append(str(path))
+        msg = f"{len(summary)} lượt vào/ra, {len(log_df)} lần ghi"
+        return summary.rename(columns=SUMMARY_COLUMNS), paths, msg
 
     def clear_history(self, day_str: str):
         try:
@@ -339,14 +420,51 @@ class App:
         self.attendance.reset_cooldowns()
         log.info("Cleared %d attendance records (%s)", deleted, day or "all")
         return (
-            self.repo.history(day), None, f"Đã xoá {deleted} bản ghi ({day or 'tất cả'})",
-            self.repo.history(limit=15),
+            self.repo.daily_summary(day).rename(columns=SUMMARY_COLUMNS), None,
+            f"Đã xoá {deleted} bản ghi ({day or 'tất cả'})", self._today(),
         )
 
     # ---------- UI ----------
     def build(self) -> gr.Blocks:
         with gr.Blocks(title="Face Attendance") as demo:
             gr.Markdown("# Điểm danh khuôn mặt")
+            with gr.Tab("Điểm danh"):
+                acam_side = gr.Radio(
+                    [CAM_FRONT, CAM_BACK, CAM_RTSP], value=CAM_FRONT, label="Camera"
+                )
+                with gr.Group(visible=False) as rtsp_box:
+                    with gr.Row(equal_height=True):
+                        rtsp_url = gr.Textbox(
+                            value=settings.rtsp_url, label="RTSP URL", type="password",
+                            placeholder="rtsp://user:pass@192.168.1.10:554/stream1", scale=4,
+                        )
+                        rtsp_start = gr.Button("▶ Kết nối", variant="primary", scale=1)
+                        rtsp_stop = gr.Button("■ Dừng", scale=1)
+                    rtsp_status = gr.Markdown(padding=True)
+                acam, acam_back, aview = _camera_stage("Nhận diện")
+                with gr.Row():
+                    recent = gr.Dataframe(
+                        self._today, label="Hôm nay — vào (lần đầu) / ra (lần cuối)", scale=3,
+                        interactive=False,
+                    )
+                    snapshot = gr.Image(label="Ảnh chụp (bấm vào một dòng)", scale=2,
+                                        interactive=False, buttons=[])
+                recent.select(self.show_snapshot, None, snapshot)
+                for webcam in (acam, acam_back):
+                    webcam.stream(
+                        self.attend_stream, [webcam], [aview, recent],
+                        stream_every=ATTEND_STREAM_EVERY, concurrency_limit=1,
+                        show_progress="hidden",
+                    )
+                rtsp_run = gr.on(
+                    [rtsp_start.click, rtsp_url.submit], self.rtsp_stream, [rtsp_url],
+                    [aview, recent, rtsp_status], show_progress="hidden",
+                )
+                rtsp_stop.click(self.rtsp_stop, None, rtsp_status, cancels=[rtsp_run])
+                acam_side.change(
+                    _show_attend_source, acam_side, [acam, acam_back, rtsp_box]
+                ).then(self.rtsp_stop, None, rtsp_status, cancels=[rtsp_run])
+
             with gr.Tab("Đăng ký"):
                 enroll_state = gr.State(None)
                 with gr.Row():
@@ -394,36 +512,6 @@ class App:
                     self.enroll_save, [name, emp, enroll_state], [status, gallery, enroll_state]
                 )
 
-            with gr.Tab("Điểm danh"):
-                acam_side = gr.Radio(
-                    [CAM_FRONT, CAM_BACK, CAM_RTSP], value=CAM_FRONT, label="Camera"
-                )
-                with gr.Group(visible=False) as rtsp_box:
-                    with gr.Row(equal_height=True):
-                        rtsp_url = gr.Textbox(
-                            value=settings.rtsp_url, label="RTSP URL", type="password",
-                            placeholder="rtsp://user:pass@192.168.1.10:554/stream1", scale=4,
-                        )
-                        rtsp_start = gr.Button("▶ Kết nối", variant="primary", scale=1)
-                        rtsp_stop = gr.Button("■ Dừng", scale=1)
-                    rtsp_status = gr.Markdown(padding=True)
-                acam, acam_back, aview = _camera_stage("Nhận diện")
-                recent = gr.Dataframe(self.repo.history(limit=15), label="Điểm danh gần nhất")
-                for webcam in (acam, acam_back):
-                    webcam.stream(
-                        self.attend_stream, [webcam], [aview, recent],
-                        stream_every=ATTEND_STREAM_EVERY, concurrency_limit=1,
-                        show_progress="hidden",
-                    )
-                rtsp_run = gr.on(
-                    [rtsp_start.click, rtsp_url.submit], self.rtsp_stream, [rtsp_url],
-                    [aview, recent, rtsp_status], show_progress="hidden",
-                )
-                rtsp_stop.click(self.rtsp_stop, None, rtsp_status, cancels=[rtsp_run])
-                acam_side.change(
-                    _show_attend_source, acam_side, [acam, acam_back, rtsp_box]
-                ).then(self.rtsp_stop, None, rtsp_status, cancels=[rtsp_run])
-
             with gr.Tab("Quản lý & Lịch sử"):
                 persons = gr.Dataframe(self.repo.list_persons, label="Người đã đăng ký")
                 with gr.Row():
@@ -441,8 +529,12 @@ class App:
                     load = gr.Button("Xem lịch sử")
                     clear = gr.Button("🗑 Xoá lịch sử", variant="stop")
                 hist_msg = gr.Markdown()
-                hist = gr.Dataframe(label="Lịch sử")
-                csv = gr.File(label="Export CSV")
+                with gr.Row():
+                    hist = gr.Dataframe(label="Vào / ra theo ngày", scale=3, interactive=False)
+                    hist_snapshot = gr.Image(label="Ảnh chụp (bấm vào một dòng)", scale=2,
+                                             interactive=False, buttons=[])
+                hist.select(self.show_snapshot, None, hist_snapshot)
+                csv = gr.File(label="Export CSV", file_count="multiple")
                 load.click(self.history, [day], [hist, csv, hist_msg])
                 clear.click(self.clear_history, [day], [hist, csv, hist_msg, recent])
         return demo
@@ -452,7 +544,8 @@ def main():
     missing = _missing_models()
     if missing:
         raise SystemExit(
-            f"Thiếu model: {missing}. Chạy: uv run python scripts/download_models.py"
+            f"Thiếu model: {missing}. Chạy: "
+            "uv run --group convert python scripts/download_models.py"
         )
     log.info("Starting at %s", datetime.now().isoformat(timespec="seconds"))
     ssl = {}
@@ -467,7 +560,8 @@ def main():
             "No TLS cert: phone cameras need HTTPS. Run: uv run python scripts/make_cert.py"
         )
     App().build().launch(
-        server_name=settings.server_host, server_port=settings.server_port, css=CSS, **ssl
+        server_name=settings.server_host, server_port=settings.server_port, css=CSS,
+        js=AUTO_RECORD_JS, **ssl
     )
 
 

@@ -1,3 +1,4 @@
+import base64
 from functools import lru_cache
 from pathlib import Path
 
@@ -16,6 +17,23 @@ def expand_bbox(
     nx1, ny1 = int(max(0, cx - side / 2)), int(max(0, cy - side / 2))
     nx2, ny2 = int(min(width, cx + side / 2)), int(min(height, cy + side / 2))
     return nx1, ny1, nx2, ny2
+
+
+def encode_snapshot(img_bgr: np.ndarray, width: int, quality: int = 85) -> str:
+    """JPEG (downscaled to `width`, never upscaled) as base64 text for the database."""
+    h, w = img_bgr.shape[:2]
+    if w > width:
+        img_bgr = cv2.resize(img_bgr, (width, round(h * width / w)), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise ValueError("JPEG encoding failed")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def decode_snapshot(b64: str) -> np.ndarray:
+    """Base64 JPEG -> RGB (for Gradio)."""
+    buf = np.frombuffer(base64.b64decode(b64), np.uint8)
+    return cv2.cvtColor(cv2.imdecode(buf, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
 
 def apply_clahe(img_bgr: np.ndarray) -> np.ndarray:
@@ -43,15 +61,18 @@ def draw_face(
     img_bgr: np.ndarray, bbox: np.ndarray, label: str, color: tuple[int, int, int]
 ) -> None:
     x1, y1, x2, y2 = bbox.astype(int)
-    thick = max(2, (x2 - x1) // 60)
+    # Sized for a 1280px-wide view, so labels stay readable when 4K previews are downscaled.
+    k = max(1.0, img_bgr.shape[1] / 1280)
+    thick = max(round(2 * k), (x2 - x1) // 60)
     cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, thick)
     if label:
-        scale = 0.6
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
-        ty = max(th + 6, y1)
-        cv2.rectangle(img_bgr, (x1, ty - th - 6), (x1 + tw + 6, ty), color, -1)
+        scale, font_thick, pad = 0.6 * k, max(2, round(2 * k)), round(6 * k)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, font_thick)
+        ty = max(th + pad, y1)
+        cv2.rectangle(img_bgr, (x1, ty - th - pad), (x1 + tw + pad, ty), color, -1)
         cv2.putText(
-            img_bgr, label, (x1 + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2
+            img_bgr, label, (x1 + pad // 2, ty - pad // 2 - 1), cv2.FONT_HERSHEY_SIMPLEX,
+            scale, (0, 0, 0), font_thick,
         )
 
 
@@ -64,29 +85,35 @@ def _font(path: Path, size: int) -> ImageFont.FreeTypeFont | None:
 
 
 def draw_badge(
-    img_bgr: np.ndarray, text: str, color: tuple[int, int, int], font_path: Path
-) -> None:
-    """Filled badge in the top-right corner. PIL for Unicode text; cv2 fallback w/o font."""
+    img_bgr: np.ndarray, text: str, color: tuple[int, int, int], font_path: Path,
+    top: int = 0,
+) -> int:
+    """Filled badge in the top-right corner, `top` px down (to stack several).
+
+    PIL for Unicode text; cv2 fallback w/o font. Returns the y just below the badge.
+    """
     h, w = img_bgr.shape[:2]
     size, pad = max(16, w // 40), max(8, w // 100)
     font = _font(font_path, size)
     if font is None:
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size / 30, 2)
-        x1, y1 = max(0, w - tw - 3 * pad), pad
+        x1, y1 = max(0, w - tw - 3 * pad), top + pad
         cv2.rectangle(img_bgr, (x1, y1), (w - pad, y1 + th + 2 * pad), color, -1)
         cv2.putText(
             img_bgr, text, (x1 + pad, y1 + th + pad), cv2.FONT_HERSHEY_SIMPLEX,
             size / 30, (255, 255, 255), 2,
         )
-        return
-    left, top, right, bottom = font.getbbox(text)
-    tw, th = right - left, bottom - top
-    box = (max(0, w - tw - 3 * pad), pad, w - pad, pad + th + 2 * pad)
+        return y1 + th + 2 * pad
+    left, top_, right, bottom = font.getbbox(text)
+    tw, th = right - left, bottom - top_
+    y1 = min(top + pad, max(0, h - th - 2 * pad))
+    box = (max(0, w - tw - 3 * pad), y1, w - pad, y1 + th + 2 * pad)
     # Only convert the badge region, not the whole frame.
     x1, y1, x2, y2 = box
     roi = Image.fromarray(cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(roi)
     rgb = (color[2], color[1], color[0])
     draw.rounded_rectangle((0, 0, x2 - x1 - 1, y2 - y1 - 1), radius=pad, fill=rgb)
-    draw.text((pad - left, pad - top), text, font=font, fill=(255, 255, 255))
+    draw.text((pad - left, pad - top_), text, font=font, fill=(255, 255, 255))
     img_bgr[y1:y2, x1:x2] = cv2.cvtColor(np.asarray(roi), cv2.COLOR_RGB2BGR)
+    return y2

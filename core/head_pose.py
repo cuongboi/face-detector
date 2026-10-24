@@ -9,17 +9,13 @@ import math
 import numpy as np
 
 
-def pose_from_matrix(matrix: np.ndarray) -> tuple[float, float]:
-    """From MediaPipe's facial transformation matrix (camera frame: x right, y up, z to viewer)."""
-    nose_dir = matrix[:3, 2]  # canonical +z (out of the face) in camera frame
-    yaw = math.degrees(math.atan2(nose_dir[0], nose_dir[2]))
-    # Elevation against the full horizontal component: atan2(y, z) blows up in profile (z -> 0).
-    pitch = math.degrees(math.atan2(nose_dir[1], math.hypot(nose_dir[0], nose_dir[2])))
-    return yaw, pitch
+def pose_from_vision(yaw: float, pitch: float) -> tuple[float, float]:
+    """From a VNFaceObservation (radians). Vision's yaw already matches; its pitch is + = down."""
+    return math.degrees(yaw), -math.degrees(pitch)
 
 
 def pose_from_kps5(kps5: np.ndarray) -> tuple[float, float]:
-    """Coarse estimate from 5 keypoints, used when MediaPipe is unavailable for the face."""
+    """Coarse estimate from 5 keypoints, used when Vision reports no pose for the face."""
     le, re, nose, ml, mr = kps5.astype(float)
     eye_mid = (le + re) / 2
     mouth_mid = (ml + mr) / 2

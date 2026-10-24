@@ -1,14 +1,14 @@
 [project]
 name = "face-attendance"
 version = "0.1.0"
-description = "Local face attendance: YOLO-face + MediaPipe + ArcFace + Qdrant + Gradio"
+description = "Local face attendance: Apple Vision + ArcFace (Core ML) + Qdrant + Gradio"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "ultralytics>=8.3.0",
-    "mediapipe>=0.10.14",
+    "pyobjc-framework-Vision>=10.3",
+    "pyobjc-framework-Quartz>=10.3",
+    "coremltools>=8.0",
     "opencv-python-headless>=4.10",
-    "onnxruntime>=1.19",
     "gradio>=6.0",
     "qdrant-client>=1.20,<1.21",
     "numpy>=1.26,<2.0",
@@ -20,6 +20,8 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8.3", "ruff>=0.6"]
+# Only for scripts/convert_models.py (ONNX / PyTorch -> Core ML) and the NAFNet arch test.
+convert = ["torch>=2.2", "onnx>=1.16", "onnx2torch>=1.5", "onnxruntime>=1.19"]
 
 [tool.ruff]
 line-length = 100

@@ -13,25 +13,26 @@ ARCFACE_TEMPLATE = np.array(
     dtype=np.float32,
 )
 
-# MediaPipe FaceMesh indices, ordered image-left to image-right to match the template.
-MP_LEFT_EYE = (33, 133)
-MP_RIGHT_EYE = (362, 263)
-MP_NOSE = 1
-MP_MOUTH_LEFT = 61
-MP_MOUTH_RIGHT = 291
 
+def kps5_from_vision(regions: dict[str, np.ndarray]) -> np.ndarray:
+    """5 ArcFace keypoints from Vision landmark regions (each (N, 2) in frame pixels, y down).
 
-def kps5_from_mediapipe(landmarks: np.ndarray) -> np.ndarray:
-    pts = landmarks[:, :2]
-    return np.stack(
-        [
-            pts[list(MP_LEFT_EYE)].mean(axis=0),
-            pts[list(MP_RIGHT_EYE)].mean(axis=0),
-            pts[MP_NOSE],
-            pts[MP_MOUTH_LEFT],
-            pts[MP_MOUTH_RIGHT],
-        ]
-    ).astype(np.float32)
+    Vision names eyes from the viewer's side, but pairs are sorted by x anyway so the order
+    always matches the template (image-left first).
+    """
+
+    def center(pupil: str, eye: str) -> np.ndarray:
+        pts = regions.get(pupil)
+        return (pts if pts is not None and len(pts) else regions[eye]).mean(axis=0)
+
+    eyes = [center("leftPupil", "leftEye"), center("rightPupil", "rightEye")]
+    eyes.sort(key=lambda p: p[0])
+    # noseCrest runs from between the eyes down to the tip; its lowest point is the tip.
+    crest = regions["noseCrest"]
+    nose = crest[crest[:, 1].argmax()]
+    lips = regions["outerLips"]
+    mouth = [lips[lips[:, 0].argmin()], lips[lips[:, 0].argmax()]]
+    return np.stack([*eyes, nose, *mouth]).astype(np.float32)
 
 
 def align_5pt(img_bgr: np.ndarray, kps5: np.ndarray, size: int = 112) -> np.ndarray:

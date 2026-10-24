@@ -1,9 +1,7 @@
 import cv2
 import numpy as np
 import pytest
-import torch
 
-from core.nafnet_arch import NAFNet
 from core.pipeline import FacePipeline
 from core.types import FaceDetection
 from utils.config import get_settings
@@ -17,6 +15,9 @@ def _bright_sharp(rng) -> np.ndarray:
 
 
 def test_nafnet_keeps_odd_shapes():
+    torch = pytest.importorskip("torch")  # `convert` group only
+    from core.nafnet_arch import NAFNet
+
     model = NAFNet(width=8, middle_blk_num=1, enc_blk_nums=(1, 1), dec_blk_nums=(1, 1)).eval()
     with torch.inference_mode():
         out = model(torch.rand(1, 3, 37, 53))
@@ -26,7 +27,7 @@ def test_nafnet_keeps_odd_shapes():
 @pytest.fixture(scope="module")
 def enhancer():
     if weights_missing:
-        pytest.skip("NAFNet weights not downloaded")
+        pytest.skip("NAFNet Core ML packages not converted")
     from core.enhancer import FaceEnhancer
 
     return FaceEnhancer(s)

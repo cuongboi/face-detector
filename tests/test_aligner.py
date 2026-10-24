@@ -1,8 +1,8 @@
 import cv2
 import numpy as np
 
-from core.aligner import ARCFACE_TEMPLATE, align_5pt
-from core.head_pose import pose_from_kps5, pose_from_matrix
+from core.aligner import ARCFACE_TEMPLATE, align_5pt, kps5_from_vision
+from core.head_pose import pose_from_kps5, pose_from_vision
 
 
 def test_align_maps_keypoints_onto_template():
@@ -33,12 +33,18 @@ def test_kps_yaw_sign_follows_nose():
     assert pose_from_kps5(kps)[0] > 15
 
 
-def test_matrix_pose_signs():
-    def rot_y(deg):
-        r = np.radians(deg)
-        m = np.eye(4)
-        m[0, 0], m[0, 2], m[2, 0], m[2, 2] = np.cos(r), np.sin(r), -np.sin(r), np.cos(r)
-        return m
+def test_vision_pose_convention():
+    yaw, pitch = pose_from_vision(np.radians(30), np.radians(10))  # Vision: + pitch = down
+    assert abs(yaw - 30) < 1e-6 and abs(pitch + 10) < 1e-6
 
-    yaw, pitch = pose_from_matrix(rot_y(30))
-    assert abs(yaw - 30) < 1e-6 and abs(pitch) < 1e-6
+
+def test_kps5_from_vision_order():
+    # Vision's left/right swapped on purpose: output must still be image-left first.
+    regions = {
+        "leftEye": np.array([[70, 50], [76, 50]], np.float32),
+        "rightEye": np.array([[36, 50], [42, 50]], np.float32),
+        "noseCrest": np.array([[56, 50], [56, 60], [56, 72]], np.float32),
+        "outerLips": np.array([[70, 92], [56, 90], [42, 92], [56, 96]], np.float32),
+    }
+    kps = kps5_from_vision(regions)
+    np.testing.assert_allclose(kps, [[39, 50], [73, 50], [56, 72], [42, 92], [70, 92]])
