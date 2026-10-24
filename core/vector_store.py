@@ -13,6 +13,7 @@ from qdrant_client.models import (
     MatchValue,
     PayloadSchemaType,
     PointStruct,
+    QueryRequest,
     VectorParams,
 )
 
@@ -62,10 +63,21 @@ class VectorStore:
 
     def search(self, embedding: np.ndarray, top_k: int = 10) -> Match | None:
         """Best person: max similarity over that person's pose vectors."""
-        hits = self.client.query_points(
-            self.collection, query=embedding.astype(float).tolist(),
-            limit=top_k, with_payload=True,
-        ).points
+        return self.search_batch(embedding[None], top_k)[0]
+
+    def search_batch(self, embeddings: np.ndarray, top_k: int = 10) -> list[Match | None]:
+        """`search` for every face of a frame in one round trip."""
+        if len(embeddings) == 0:
+            return []
+        requests = [
+            QueryRequest(query=e.astype(float).tolist(), limit=top_k, with_payload=True)
+            for e in embeddings
+        ]
+        responses = self.client.query_batch_points(self.collection, requests)
+        return [self._best(r.points) for r in responses]
+
+    @staticmethod
+    def _best(hits) -> Match | None:
         best: Match | None = None
         for hit in hits:
             p = hit.payload or {}

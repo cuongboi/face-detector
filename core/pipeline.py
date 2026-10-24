@@ -3,8 +3,8 @@ import numpy as np
 from core.aligner import align_5pt
 from core.embedder import Embedder
 from core.enhancer import FaceEnhancer
-from core.hybrid_detector import HybridDetector
 from core.types import FaceResult
+from core.vision_detector import VisionDetector
 from utils.face_utils import expand_bbox
 
 
@@ -12,7 +12,7 @@ class FacePipeline:
     """detect -> (restore) -> align -> embed, shared by enrollment and attendance."""
 
     def __init__(
-        self, detector: HybridDetector, embedder: Embedder, enhancer: FaceEnhancer | None = None
+        self, detector: VisionDetector, embedder: Embedder, enhancer: FaceEnhancer | None = None
     ):
         self.detector = detector
         self.embedder = embedder

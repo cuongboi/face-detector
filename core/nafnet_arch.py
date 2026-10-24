@@ -1,6 +1,8 @@
 """NAFNet (Chen et al., ECCV 2022), ported from megvii-research/NAFNet (MIT).
 
-Inference-only: plain-torch LayerNorm2d instead of the custom autograd function, no dropout.
+Inference-only: channel LayerNorm via F.layer_norm instead of the custom autograd function
+(Core ML maps it to its native op; a hand-written variance overflows fp16 on the Neural Engine),
+no dropout.
 Module names match the official checkpoints so their `params` state dicts load strictly.
 """
 
@@ -17,10 +19,8 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        y = (x - mu) / (var + self.eps).sqrt()
-        return self.weight.view(1, -1, 1, 1) * y + self.bias.view(1, -1, 1, 1)
+        y = F.layer_norm(x.permute(0, 2, 3, 1), (x.shape[1],), self.weight, self.bias, self.eps)
+        return y.permute(0, 3, 1, 2)
 
 
 class SimpleGate(nn.Module):

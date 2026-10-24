@@ -1,15 +1,16 @@
 """NAFNet restoration of face crops: SIDD denoising for dark frames, GoPro deblurring for blur.
 
-Runs on face crops only (not whole frames) so it stays cheap on Apple Silicon (MPS).
+Compiled Core ML models with a fixed square input (scripts/convert_models.py), so they run on the
+Neural Engine (~15 ms per crop on M1); crops are reflect-padded up to that size.
+Runs on face crops only (not whole frames).
 """
 
 import threading
 
+import coremltools as ct
 import cv2
 import numpy as np
-import torch
 
-from core.nafnet_arch import GOPRO_WIDTH32, SIDD_WIDTH32, NAFNet
 from utils.config import Settings
 from utils.face_utils import apply_clahe, sharpness
 from utils.logger import get_logger
@@ -24,31 +25,28 @@ def mean_luma(img_bgr: np.ndarray) -> float:
 class FaceEnhancer:
     def __init__(self, settings: Settings):
         self.s = settings
-        self.device = torch.device(settings.enhance_device)
-        if self.device.type == "mps" and not torch.backends.mps.is_available():
-            self.device = torch.device("cpu")
-        self.denoiser = self._load(settings.denoise_model, SIDD_WIDTH32)
-        self.deblurrer = self._load(settings.deblur_model, GOPRO_WIDTH32)
-        # MPS is not safe to drive from several Gradio worker threads at once.
+        self.size = settings.enhance_max_side  # the models' fixed input side
+        self.denoiser = self._load(settings.denoise_model)
+        self.deblurrer = self._load(settings.deblur_model)
         self._lock = threading.Lock()
-        # First MPS call compiles kernels (~1s); do it now instead of on the first live frame.
+        # Warm up now instead of on the first live frame.
         blank = np.zeros((64, 64, 3), np.uint8)
         self._run(self.denoiser, blank)
         self._run(self.deblurrer, blank)
-        log.info("FaceEnhancer on %s", self.device)
+        log.info("FaceEnhancer: Core ML %dx%d", self.size, self.size)
 
-    def _load(self, name: str, config: dict) -> NAFNet:
-        model = NAFNet(**config)
-        state = torch.load(self.s.model_path(name), map_location="cpu", weights_only=True)
-        model.load_state_dict(state.get("params", state))
-        return model.eval().to(self.device)
+    def _load(self, name: str) -> ct.models.CompiledMLModel:
+        path = str(self.s.model_path(name))
+        return ct.models.CompiledMLModel(path, compute_units=ct.ComputeUnit.ALL)
 
-    @torch.inference_mode()
-    def _run(self, model: NAFNet, img_bgr: np.ndarray) -> np.ndarray:
-        rgb = np.ascontiguousarray(img_bgr[..., ::-1])
-        x = torch.from_numpy(rgb).to(self.device).permute(2, 0, 1)[None].float() / 255
-        y = model(x).clamp_(0, 1)[0].permute(1, 2, 0).mul_(255).round_().byte().cpu().numpy()
-        return np.ascontiguousarray(y[..., ::-1])
+    def _run(self, model: ct.models.CompiledMLModel, img_bgr: np.ndarray) -> np.ndarray:
+        h, w = img_bgr.shape[:2]
+        # Reflect padding keeps the border statistics natural; zeros would read as dark/blur.
+        mode = cv2.BORDER_REFLECT_101 if min(h, w) > 1 else cv2.BORDER_REPLICATE
+        padded = cv2.copyMakeBorder(img_bgr, 0, self.size - h, 0, self.size - w, mode)
+        x = cv2.dnn.blobFromImage(padded, scalefactor=1 / 255, swapRB=True)
+        y = model.predict({"input": x})["output"][0, :, :h, :w].transpose(1, 2, 0)[..., ::-1]
+        return np.ascontiguousarray((y * 255).round().astype(np.uint8))
 
     def enhance(self, crop_bgr: np.ndarray) -> tuple[np.ndarray, list[str]]:
         """Restore a face crop if it is dark and/or blurry.
