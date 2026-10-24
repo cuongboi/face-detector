@@ -1,4 +1,4 @@
-"""Guided multi-angle enrollment: front, left, right, up, down.
+"""Guided multi-angle enrollment: front, left/right (turned and full profile), up, down.
 
 UI-independent state machine. "left"/"right" are the subject's own left/right in an
 un-mirrored camera frame (turning to your left moves the nose towards image right).
@@ -12,22 +12,27 @@ from core.types import FaceResult
 from utils.config import Settings
 from utils.face_utils import sharpness
 
-POSES = ("front", "left", "right", "up", "down")
+POSES = ("front", "left", "full_left", "right", "full_right", "up", "down")
 POSE_HINTS = {
     "front": "Nhìn thẳng vào camera",
     "left": "Quay mặt sang TRÁI",
+    "full_left": "Quay HẲN mặt sang TRÁI (nhìn ngang)",
     "right": "Quay mặt sang PHẢI",
+    "full_right": "Quay HẲN mặt sang PHẢI (nhìn ngang)",
     "up": "Ngẩng mặt LÊN",
     "down": "Cúi mặt XUỐNG",
 }
+DONE_HINT = f"Đã đủ {len(POSES)} góc, bấm Lưu"
 
 
 def classify_pose(yaw: float, pitch: float, s: Settings) -> str | None:
-    if abs(yaw) > s.max_angle or abs(pitch) > s.max_angle:
+    if abs(yaw) > s.full_yaw_max or abs(pitch) > s.max_angle:
         return None
     if abs(yaw) < s.front_max_angle and abs(pitch) < s.front_max_angle:
         return "front"
     if abs(pitch) < s.tilt_pitch_min:
+        if abs(yaw) >= s.full_yaw_min:
+            return "full_left" if yaw > 0 else "full_right"
         if yaw >= s.side_yaw_min:
             return "left"
         if yaw <= -s.side_yaw_min:
@@ -89,7 +94,7 @@ class EnrollmentSession:
         pose = classify_pose(det.yaw or 0.0, det.pitch or 0.0, s)
         target = self.target
         if target is None:
-            return OfferResult(pose, None, "Đã đủ 5 góc, bấm Lưu")
+            return OfferResult(pose, None, DONE_HINT)
         if pose is None or pose not in self.missing or (target == "front" and pose != "front"):
             self._pending_pose = None
             return OfferResult(pose, None, POSE_HINTS[target])
@@ -98,9 +103,10 @@ class EnrollmentSession:
             return OfferResult(pose, None, "Mặt quá nhỏ, lại gần camera hơn")
         if sharpness(face.aligned) < s.min_sharpness:
             return OfferResult(pose, None, "Ảnh bị mờ, giữ yên")
-        front = self.captures.get("front")
-        if front is not None:
-            sim = float(np.dot(front.embedding, face.embedding))
+        if self.captures:
+            # Best match over all captured poses: a full profile barely resembles the frontal
+            # shot, but does resemble the 30-degree one captured before it.
+            sim = max(float(np.dot(c.embedding, face.embedding)) for c in self.captures.values())
             if sim < s.same_person_min_sim:
                 return OfferResult(pose, None, "Không khớp với ảnh chính diện, kiểm tra lại người")
 
@@ -115,4 +121,4 @@ class EnrollmentSession:
         )
         self._pending_pose = None
         nxt = self.target
-        return OfferResult(pose, pose, POSE_HINTS[nxt] if nxt else "Đã đủ 5 góc, bấm Lưu")
+        return OfferResult(pose, pose, POSE_HINTS[nxt] if nxt else DONE_HINT)

@@ -13,7 +13,8 @@ def pose_from_matrix(matrix: np.ndarray) -> tuple[float, float]:
     """From MediaPipe's facial transformation matrix (camera frame: x right, y up, z to viewer)."""
     nose_dir = matrix[:3, 2]  # canonical +z (out of the face) in camera frame
     yaw = math.degrees(math.atan2(nose_dir[0], nose_dir[2]))
-    pitch = math.degrees(math.atan2(nose_dir[1], nose_dir[2]))
+    # Elevation against the full horizontal component: atan2(y, z) blows up in profile (z -> 0).
+    pitch = math.degrees(math.atan2(nose_dir[1], math.hypot(nose_dir[0], nose_dir[2])))
     return yaw, pitch
 
 

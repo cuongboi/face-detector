@@ -18,7 +18,10 @@ def test_classify_pose(settings):
     assert classify_pose(0, 25, settings) == "up"
     assert classify_pose(0, -25, settings) == "down"
     assert classify_pose(15, 0, settings) is None  # ambiguous band
-    assert classify_pose(70, 0, settings) is None  # full profile rejected
+    assert classify_pose(60, 0, settings) == "full_left"
+    assert classify_pose(-60, 0, settings) == "full_right"
+    assert classify_pose(60, 25, settings) is None  # turned and tilted
+    assert classify_pose(89, 0, settings) is None  # beyond full_yaw_max
 
 
 def test_full_session_requires_front_first_and_hold(settings):
@@ -27,7 +30,11 @@ def test_full_session_requires_front_first_and_hold(settings):
     assert s.offer(_face(30, 0, emb), 0.0).captured is None  # front must come first
     assert s.offer(_face(0, 0, emb), 1.0).captured is None  # hold starts
     assert s.offer(_face(0, 0, emb), 1.6).captured == "front"
-    for pose, (y, p) in {"left": (30, 0), "right": (-30, 0), "up": (0, 25)}.items():
+    turns = {
+        "left": (30, 0), "full_left": (65, 0), "right": (-30, 0), "full_right": (-65, 0),
+        "up": (0, 25),
+    }
+    for pose, (y, p) in turns.items():
         assert s.offer(_face(y, p, emb), 0.0, manual=True).captured == pose
     assert not s.complete
     assert s.offer(_face(0, -25, emb), 0.0, manual=True).captured == "down"
@@ -41,3 +48,15 @@ def test_rejects_different_person(settings):
     other[:256] = -1  # orthogonal => cosine 0
     res = s.offer(_face(30, 0, other), 0.0, manual=True)
     assert res.captured is None and "left" not in s.captures
+
+
+def test_profile_matched_against_any_captured_pose(settings):
+    s = EnrollmentSession(settings)
+    front, side, profile = np.zeros(512), np.zeros(512), np.zeros(512)
+    front[0] = 1
+    side[:2] = (0.6, 0.8)  # cos(front, side) = 0.6
+    profile[1:3] = (0.6, 0.8)  # cos(front, profile) = 0, cos(side, profile) = 0.48
+    s.offer(_face(0, 0, front), 0.0, manual=True)
+    assert s.offer(_face(65, 0, profile), 0.0, manual=True).captured is None
+    assert s.offer(_face(30, 0, side), 0.0, manual=True).captured == "left"
+    assert s.offer(_face(65, 0, profile), 0.0, manual=True).captured == "full_left"

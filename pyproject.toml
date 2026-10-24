@@ -15,6 +15,7 @@ dependencies = [
     "pillow>=10.0",
     "pydantic-settings>=2.4",
     "pandas>=2.2",
+    "gdown>=6.4.2",
 ]
 
 [dependency-groups]

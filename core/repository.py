@@ -83,3 +83,12 @@ class Repository:
             query += f" LIMIT {int(limit)}"
         with self._lock:
             return pd.read_sql_query(query, self.conn, params=params)
+
+    def clear_history(self, day: date | None = None) -> int:
+        query = "DELETE FROM attendance"
+        params: list = []
+        if day is not None:
+            query += " WHERE date(timestamp) = ?"
+            params.append(day.isoformat())
+        with self._lock, self.conn:
+            return self.conn.execute(query, params).rowcount

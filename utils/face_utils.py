@@ -1,5 +1,9 @@
+from functools import lru_cache
+from pathlib import Path
+
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 
 def expand_bbox(
@@ -49,3 +53,40 @@ def draw_face(
         cv2.putText(
             img_bgr, label, (x1 + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 2
         )
+
+
+@lru_cache(maxsize=8)
+def _font(path: Path, size: int) -> ImageFont.FreeTypeFont | None:
+    try:
+        return ImageFont.truetype(str(path), size)
+    except OSError:
+        return None
+
+
+def draw_badge(
+    img_bgr: np.ndarray, text: str, color: tuple[int, int, int], font_path: Path
+) -> None:
+    """Filled badge in the top-right corner. PIL for Unicode text; cv2 fallback w/o font."""
+    h, w = img_bgr.shape[:2]
+    size, pad = max(16, w // 40), max(8, w // 100)
+    font = _font(font_path, size)
+    if font is None:
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size / 30, 2)
+        x1, y1 = max(0, w - tw - 3 * pad), pad
+        cv2.rectangle(img_bgr, (x1, y1), (w - pad, y1 + th + 2 * pad), color, -1)
+        cv2.putText(
+            img_bgr, text, (x1 + pad, y1 + th + pad), cv2.FONT_HERSHEY_SIMPLEX,
+            size / 30, (255, 255, 255), 2,
+        )
+        return
+    left, top, right, bottom = font.getbbox(text)
+    tw, th = right - left, bottom - top
+    box = (max(0, w - tw - 3 * pad), pad, w - pad, pad + th + 2 * pad)
+    # Only convert the badge region, not the whole frame.
+    x1, y1, x2, y2 = box
+    roi = Image.fromarray(cv2.cvtColor(img_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(roi)
+    rgb = (color[2], color[1], color[0])
+    draw.rounded_rectangle((0, 0, x2 - x1 - 1, y2 - y1 - 1), radius=pad, fill=rgb)
+    draw.text((pad - left, pad - top), text, font=font, fill=(255, 255, 255))
+    img_bgr[y1:y2, x1:x2] = cv2.cvtColor(np.asarray(roi), cv2.COLOR_RGB2BGR)

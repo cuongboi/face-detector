@@ -25,4 +25,5 @@ class FaceResult:
     detection: FaceDetection
     aligned: np.ndarray  # 112x112 BGR
     embedding: np.ndarray  # (512,) L2-normalized
+    enhanced: list[str] = field(default_factory=list)  # NAFNet steps applied: denoise, deblur
     extras: dict = field(default_factory=dict)

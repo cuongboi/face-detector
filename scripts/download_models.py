@@ -17,6 +17,9 @@ LANDMARKER_URL = (
     "face_landmarker/float16/1/face_landmarker.task"
 )
 BUFFALO_L_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+# Official NAFNet width-32 checkpoints (megvii-research/NAFNet README), hosted on Google Drive.
+NAFNET_SIDD_GDRIVE_ID = "1lsByk21Xw-6aW7epCwOQxvm6HYCQZPHZ"
+NAFNET_GOPRO_GDRIVE_ID = "1Fr2QadtDCEXg6iwWX8OzeZLbHOx2t5Bj"
 
 
 def _download(url: str, dest: Path) -> None:
@@ -24,6 +27,16 @@ def _download(url: str, dest: Path) -> None:
     tmp = dest.with_suffix(dest.suffix + ".part")
     with urllib.request.urlopen(url) as resp, open(tmp, "wb") as f:
         shutil.copyfileobj(resp, f)
+    tmp.rename(dest)
+
+
+def _download_gdrive(file_id: str, dest: Path) -> None:
+    # Drive puts a virus-scan confirmation page in front of large files; gdown handles it.
+    import gdown
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    if gdown.download(id=file_id, output=str(tmp), quiet=False) is None:
+        raise SystemExit(f"Download failed: {dest.name} (Google Drive id {file_id})")
     tmp.rename(dest)
 
 
@@ -54,7 +67,15 @@ def main() -> None:
                 with zf.open(member) as src, open(embedder, "wb") as dst:
                     shutil.copyfileobj(src, dst)
 
-    for name in (s.yolo_model, s.landmarker_model, s.embedder_model):
+    for file_id, name in (
+        (NAFNET_SIDD_GDRIVE_ID, s.denoise_model), (NAFNET_GOPRO_GDRIVE_ID, s.deblur_model)
+    ):
+        dest = s.model_path(name)
+        if not dest.exists():
+            _download_gdrive(file_id, dest)
+
+    names = (s.yolo_model, s.landmarker_model, s.embedder_model, s.denoise_model, s.deblur_model)
+    for name in names:
         path = s.model_path(name)
         print(f"✓ {name}  {path.stat().st_size / 1e6:.1f} MB  sha256={_sha256(path)[:16]}…")
 

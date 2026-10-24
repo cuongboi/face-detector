@@ -100,3 +100,6 @@ class AttendanceService:
 
     def forget_person(self, person_id: int) -> None:
         self._last_logged.pop(person_id, None)
+
+    def reset_cooldowns(self) -> None:
+        self._last_logged.clear()
