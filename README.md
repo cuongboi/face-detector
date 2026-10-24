@@ -5,6 +5,67 @@
 align 5 điểm chuẩn ArcFace → **ArcFace w600k_r50 (Core ML, Neural Engine)** → **Qdrant** → **Gradio**.
 Không cần PyTorch / ONNX Runtime lúc chạy; chỉ cần macOS 13+ trên Apple Silicon.
 
+## Luồng kỹ thuật
+
+Mỗi khung hình (webcam trình duyệt hoặc RTSP) đi qua `FacePipeline.analyze`
+([core/pipeline.py](core/pipeline.py)), dùng chung cho Đăng ký và Điểm danh:
+
+```mermaid
+flowchart TD
+    SRC["Khung hình BGR<br/>webcam trình duyệt / RTSP"] --> BR["vision_bridge<br/>numpy → CGImage"]
+    BR --> DET["Apple Vision · Neural Engine<br/>FaceRectangles rev3: toàn khung + lưới tile NxN"]
+    DET --> NMS["Lọc vision_conf, min_face_size<br/>NMS gộp mặt trùng giữa các tile"]
+    NMS --> LM["Vision FaceLandmarks<br/>76 điểm + yaw/pitch"]
+    LM --> KPS["kps5: 2 mắt, mũi, 2 khoé miệng"]
+    KPS --> ENH{"Crop mặt tối / mờ?"}
+    ENH -- "tối" --> DN["NAFNet-SIDD + CLAHE<br/>Core ML"]
+    ENH -- "mờ" --> DB["NAFNet-GoPro<br/>Core ML"]
+    ENH -- "bình thường" --> AL
+    DN --> AL["align_5pt<br/>warp 112×112 chuẩn ArcFace"]
+    DB --> AL
+    AL --> EMB["ArcFace w600k_r50<br/>Core ML · Neural Engine, batch ≤ 16"]
+    EMB --> VEC["Vector 512-d, chuẩn hoá L2"]
+    VEC --> MODE{"Tab"}
+    MODE -- "Đăng ký" --> ENR["EnrollmentSession<br/>phân loại góc theo yaw/pitch"]
+    ENR --> QA[("Qdrant<br/>1 vector / góc / người")]
+    ENR --> SA[("SQLite<br/>người")]
+    MODE -- "Điểm danh" --> SR["Qdrant search top-k<br/>cosine ≥ match_threshold"]
+    SR --> TR["AttendanceService<br/>track IoU + vote_frames"]
+    TR --> SB[("SQLite<br/>vào/ra + ảnh JPEG base64")]
+    TR --> UI["Gradio: khung + nhãn trạng thái"]
+```
+
+Quyết định cho mỗi mặt, mỗi khung hình (`AttendanceService._decide`, [core/attendance.py](core/attendance.py)):
+
+```mermaid
+flowchart TD
+    M{"Khớp ai?<br/>cosine ≥ match_threshold"} -- "không" --> U["unknown"]
+    M -- "có" --> W{"Đang chờ<br/>next_write?"}
+    W -- "có" --> C["cooldown"]
+    W -- "không" --> V{"vote_frames khung liên tiếp<br/>cùng một người?"}
+    V -- "chưa" --> VF["verifying"]
+    V -- "đủ" --> R["record_sighting<br/>(điểm TB các vote)"]
+    R -- "lần đầu trong ngày /<br/>điểm cao hơn trong in_window" --> IN["checked_in<br/>chờ sighting_interval"]
+    R -- "sau in_window" --> OUT["checked_out<br/>ghi đè Ra, chờ cooldown"]
+    R -- "không ghi gì" --> C
+```
+
+## Luồng sử dụng
+
+```mermaid
+flowchart LR
+    A["Cài đặt<br/>uv sync · download_models · Qdrant"] --> B["uv run python app.py"]
+    B --> C["Tab Đăng ký<br/>họ tên + mã NV"]
+    C --> D["Theo hướng dẫn 7 góc<br/>front → left → full_left → right → full_right → up → down"]
+    D --> E{"Đủ 7 góc?"}
+    E -- "chưa" --> D
+    E -- "đủ" --> F["💾 Lưu"]
+    F --> G["Tab Điểm danh<br/>webcam hoặc Camera IP (RTSP)"]
+    G --> H["Đứng trước camera<br/>khớp liên tiếp vote_frames khung"]
+    H --> I["Ghi Vào (lần đầu trong ngày)<br/>Ra (các lần sau, ghi đè)"]
+    I --> J["Tab Quản lý & Lịch sử<br/>xem ảnh vào/ra · xoá người · export CSV"]
+```
+
 ## Cài đặt
 
 ```bash
@@ -92,4 +153,4 @@ Cấu trúc: `core/` (vision_detector, vision_bridge, aligner, head_pose, embedd
 attendance, enrollment, pipeline), `utils/` (config, logger, face_utils), `app.py` (UI),
 `scripts/convert_models.py` (ONNX/PyTorch → Core ML, kiểm tra sai số so với model gốc).
 SQLite (`data/attendance.db`) là nguồn dữ liệu chính cho người/lịch sử; Qdrant chỉ lưu vector
-(5 vector/người, mỗi góc một vector).
+(7 vector/người, mỗi góc một vector).
